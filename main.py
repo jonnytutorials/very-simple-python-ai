@@ -1,144 +1,223 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import json
 import os
+import logging
+from datetime import datetime
+import argparse
 
+# Configure logging: stdout + file with timestamps and levels
+# Notes: Use logging instead of print for production-ready scripts.
+#       RotatingFileHandler could be added for large training runs.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # stdout
+        logging.FileHandler(f'char_rnn_training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Check CUDA availability early
 if not torch.cuda.is_available():
-    print("You are currently using your CPU for the training of this Model. Consider installing CUDA, if you have a NVIDIA GPU, that supports it!")
+    logger.warning("CUDA not available. Using CPU. Install CUDA-enabled PyTorch for GPU acceleration.")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using Device:", device)
+logger.info(f"Using device: {device}")
 
-# === Modell ===
+
+# === Model (optimized with dropout for regularization) ===
+# Notes: Added dropout to prevent overfitting. Increased default hidden_dim.
+#        Use batch_first=True consistently.
 class CharRNN(nn.Module):
-    def __init__(self, vocab_size, embedding_dim=256, hidden_dim=256, num_layers=2):
+    def __init__(self, vocab_size, embedding_dim=256, hidden_dim=512, num_layers=2, dropout=0.2):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        self.rnn = nn.LSTM(embedding_dim, hidden_dim, batch_first=True, num_layers=num_layers)
+        self.dropout = nn.Dropout(dropout)
+        self.rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers, batch_first=True,
+                           dropout=dropout if num_layers > 1 else 0)
         self.fc = nn.Linear(hidden_dim, vocab_size)
 
     def forward(self, x, hidden=None):
         x = self.embedding(x)
+        x = self.dropout(x)
         out, hidden = self.rnn(x, hidden)
-        out = self.fc(out[:, -1, :])  # Ausgabe des letzten Zeitschritts
+        out = self.fc(out[:, -1, :])  # Last timestep output
         return out, hidden
 
-# === Text vorbereiten ===
-def load_text_and_prepare_tensor(file_path="training_data_german.txt", seq_length=50):
+
+# === Data preparation (batched for efficiency) ===
+# Notes: Added batching to leverage parallelism. Use DataLoader for shuffling.
+#        Validate file existence early.
+def load_text_and_prepare_dataset(file_path="training_data_german.txt", seq_length=50, batch_size=64):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Training file '{file_path}' not found. Please create it with German text data.")
+
+    logger.info(f"Loading data from {file_path}")
     with open(file_path, "r", encoding="utf-8") as f:
         text = f.read().lower()
 
-    # Alle Zeichen, auch Umlaute, Sonderzeichen, Zahlen, Leerzeichen
     chars = sorted(list(set(text)))
     char2idx = {ch: i for i, ch in enumerate(chars)}
     idx2char = {i: ch for ch, i in char2idx.items()}
+    logger.info(f"Vocabulary size: {len(chars)} characters")
 
-    data = [char2idx[c] for c in text if c in char2idx]
-    input_sequences = []
-    target_sequences = []
-
+    data = [char2idx[c] for c in text]
+    inputs, targets = [], []
     for i in range(len(data) - seq_length):
-        input_seq = data[i:i+seq_length]
-        target = data[i+seq_length]
-        input_sequences.append(input_seq)
-        target_sequences.append(target)
+        inputs.append(data[i:i + seq_length])
+        targets.append(data[i + seq_length])
 
-    X = torch.tensor(input_sequences, dtype=torch.long)  # long für Embedding
-    Y = torch.tensor(target_sequences, dtype=torch.long)
+    dataset = torch.utils.data.TensorDataset(
+        torch.tensor(inputs, dtype=torch.long),
+        torch.tensor(targets, dtype=torch.long)
+    )
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    return X, Y, char2idx, idx2char
+    logger.info(f"Dataset size: {len(dataset)} sequences")
+    return dataloader, char2idx, idx2char
 
-# === Modell speichern / laden ===
+
+# === Model/Vocab persistence ===
 def save_model(model, path="char_rnn_model.pt"):
     torch.save(model.state_dict(), path)
+    logger.info(f"Model saved to {path}")
 
-def load_model(model, path="char_rnn_model.pt"):
-    model.load_state_dict(torch.load(path, map_location=device))
 
-def save_vocab(vocab, path="vocab.json"):
+def load_model(model, path="char_rnn_model.pt", map_location=None):
+    model.load_state_dict(torch.load(path, map_location=map_location))
+    logger.info(f"Model loaded from {path}")
+
+
+def save_vocab(char2idx, path="vocab.json"):
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(vocab, f)
+        json.dump(char2idx, f)
+    logger.info(f"Vocab saved to {path}")
+
 
 def load_vocab(path="vocab.json"):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# === Training ===
-def train(model, X, Y, epochs=10, lr=0.001):
+
+# === Training loop (batched, with validation-like loss tracking) ===
+# Notes: Process in batches for speed. Added gradient clipping.
+#        Early stopping or validation could be added next.
+def train(model, dataloader, epochs=10, lr=0.001):
     model.train()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)  # AdamW + L2 reg
     criterion = nn.CrossEntropyLoss()
 
+    logger.info(f"Starting training for {epochs} epochs (lr={lr})")
     for epoch in range(epochs):
-        optimizer.zero_grad()
-        inputs = X.to(device)
-        targets = Y.to(device)
+        total_loss = 0
+        num_batches = 0
 
-        outputs, _ = model(inputs)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
+        for batch_inputs, batch_targets in dataloader:
+            batch_inputs, batch_targets = batch_inputs.to(device), batch_targets.to(device)
 
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f}")
+            optimizer.zero_grad()
+            outputs, _ = model(batch_inputs)
+            loss = criterion(outputs, batch_targets)
+            loss.backward()
 
-# === Text generieren ===
-def sample(model, char2idx, idx2char, start_str="hallo", length=100):
+            # Gradient clipping to prevent explosion
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            optimizer.step()
+            total_loss += loss.item()
+            num_batches += 1
+
+        avg_loss = total_loss / num_batches
+        logger.info(f"Epoch {epoch + 1}/{epochs} - Avg Loss: {avg_loss:.4f}")
+
+
+# === Generation (top-k sampling for better diversity) ===
+# Notes: Top-k sampling instead of pure multinomial for coherent output.
+#        Fixed input_tensor shape handling.
+def sample(model, char2idx, idx2char, start_str="hallo", length=100, top_k=50):
     model.eval()
     input_seq = [char2idx.get(ch, 0) for ch in start_str.lower()]
-    input_tensor = torch.tensor(input_seq, dtype=torch.long).unsqueeze(0).to(device)  # batch=1
+    input_tensor = torch.tensor([input_seq], dtype=torch.long).to(device)
 
     hidden = None
     generated = start_str
 
     with torch.no_grad():
-        for i in range(length):
-            output, hidden = model(input_tensor, hidden)
-            probs = torch.softmax(output, dim=-1).cpu()
-            char_idx = torch.multinomial(probs, num_samples=1).item()
-            char = idx2char.get(char_idx, '?')
+        for _ in range(length):
+            output, hidden = model(input_tensor[:, -1:], hidden)  # Use last char only
+            probs = F.softmax(output, dim=-1)
+            # Top-k sampling
+            probs_topk, topk_indices = torch.topk(probs, top_k)
+            probs_topk = probs_topk / probs_topk.sum(dim=-1, keepdim=True)
+            char_idx = torch.multinomial(probs_topk, 1).squeeze().item()
+            char_idx_full = topk_indices[0, char_idx].item()
+            char = idx2char.get(char_idx_full, '?')
             generated += char
-
-            input_tensor = torch.tensor([[char_idx]], dtype=torch.long).to(device)
+            input_tensor = torch.tensor([[char_idx_full]], dtype=torch.long).to(device)
 
     return generated
 
-# === Hauptprogramm ===
+
+# === CLI Interface ===
+# Notes: Added argparse for flexibility (epochs, seq_length, etc.).
 if __name__ == "__main__":
-    seq_length = 50
+    parser = argparse.ArgumentParser(description="Char-RNN German text generator")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--seq-length", type=int, default=50, help="Sequence length")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--data-file", default="training_data_german.txt", help="Training data file")
+    args = parser.parse_args()
 
-    if not os.path.exists("training_data_german.txt"):
-        print("❌ create the file 'training_data_german.txt' with training data!")
-        exit()
+    # Load data
+    dataloader, char2idx, idx2char = load_text_and_prepare_dataset(
+        args.data_file, args.seq_length, args.batch_size
+    )
 
-    X, Y, char2idx, idx2char = load_text_and_prepare_tensor("training_data_german.txt", seq_length)
+    # Initialize model
+    model = CharRNN(
+        vocab_size=len(char2idx),
+        embedding_dim=256,
+        hidden_dim=512,
+        num_layers=2,
+        dropout=0.2
+    ).to(device)
 
-    # Modell mit passenden Parametern erstellen
-    model = CharRNN(vocab_size=len(char2idx), embedding_dim=256, hidden_dim=256, num_layers=2).to(device)
-
-    # Falls Modell schon existiert, laden
-    if os.path.exists("char_rnn_model.pt") and os.path.exists("vocab.json"):
-        print("🔁 Loading Modul and Vocabulary...")
-        load_model(model, "char_rnn_model.pt")
-        char2idx = load_vocab("vocab.json")
-        idx2char = {int(i): ch for ch, i in char2idx.items()}
+    # Load existing model/vocab if available
+    model_exists = os.path.exists("char_rnn_model.pt")
+    vocab_exists = os.path.exists("vocab.json")
+    if model_exists and vocab_exists:
+        logger.info("Loading existing model and vocabulary...")
+        load_model(model, map_location=device)
+        saved_vocab = load_vocab()
+        # Rebuild idx2char if vocab mismatch
+        if set(saved_vocab.keys()) == set(char2idx.keys()):
+            char2idx = saved_vocab
+            idx2char = {int(k): v for k, v in char2idx.items()}
+        else:
+            logger.warning("Vocab mismatch. Using new vocab.")
     else:
-        print("🧠 New Model Created and will be Trained.")
+        logger.info("Creating new model. Training from scratch.")
         save_vocab(char2idx)
 
-    epochen = int(input("for how many epochs do you want to train the AI? "))
-    train(model, X, Y, epochs=epochen)
+    # Training
+    train(model, dataloader, epochs=args.epochs)
 
+    # Save
     save_model(model)
     save_vocab(char2idx)
 
-    print("\n✅ Training was succesfull new Model saved and you can now chat with the AI.")
+    logger.info("✅ Training completed. Model saved.")
 
-    print("\n🤖 Text with the AI (\"exit\" to Exit):")
+    # Interactive generation
+    logger.info("🤖 Interactive mode. Type 'exit' to quit.")
     while True:
-        user_input = input("you: ")
-        if user_input.lower() == "exit":
+        user_input = input("You: ").strip()
+        if user_input.lower() in ['exit', 'quit']:
             break
-        output_text = sample(model, char2idx, idx2char, start_str=user_input, length=100)
-        print("AI:", output_text)
-
+        if user_input:
+            output = sample(model, char2idx, idx2char, start_str=user_input, length=100)
+            print(f"AI: {output}")
