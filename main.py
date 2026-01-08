@@ -4,6 +4,9 @@ import torch.optim as optim
 import json
 import os
 
+if not torch.cuda.is_available():
+    print("You are currently using your CPU for the training of this Model. Consider installing CUDA, if you have a NVIDIA GPU, that supports it!")
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using Device:", device)
 
@@ -22,7 +25,7 @@ class CharRNN(nn.Module):
         return out, hidden
 
 # === Text vorbereiten ===
-def load_text_and_prepare_tensor(file_path="text_training_data.txt", seq_length=50):
+def load_text_and_prepare_tensor(file_path="training_data_german.txt", seq_length=50):
     with open(file_path, "r", encoding="utf-8") as f:
         text = f.read().lower()
 
@@ -104,11 +107,11 @@ def sample(model, char2idx, idx2char, start_str="hallo", length=100):
 if __name__ == "__main__":
     seq_length = 50
 
-    if not os.path.exists("text_training_data.txt"):
-        print("❌ create the file 'text_training_data.txt' with training data!")
+    if not os.path.exists("training_data_german.txt"):
+        print("❌ create the file 'training_data_german.txt' with training data!")
         exit()
 
-    X, Y, char2idx, idx2char = load_text_and_prepare_tensor("text_training_data.txt", seq_length)
+    X, Y, char2idx, idx2char = load_text_and_prepare_tensor("training_data_german.txt", seq_length)
 
     # Modell mit passenden Parametern erstellen
     model = CharRNN(vocab_size=len(char2idx), embedding_dim=256, hidden_dim=256, num_layers=2).to(device)
@@ -138,3 +141,4 @@ if __name__ == "__main__":
             break
         output_text = sample(model, char2idx, idx2char, start_str=user_input, length=100)
         print("AI:", output_text)
+
