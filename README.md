@@ -3,4 +3,5 @@ i made this becuase i was bored this is just very basic using torch and even sup
 
 IMPORTANT: this ai that comes with the premade training date is only in german you can do your own training data by deleting everyting in "text_training_data.txt" and putting your own thing into it so the ai will for example only speak in brainrot tearms
 
+if you want to delete your current ai then simply delete the .pt fileand rerun the program
 
