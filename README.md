@@ -20,10 +20,10 @@ python main.py --epochs 50 --batch-size 256 --seq-length 64
 ```
 
 ## Parameters:
-- --epochs: Training iterations (default: 10)
-- --seq-length: Input sequence length (default: 50, higher = longer context memory)
-- --batch-size: Parallel sequences per batch (default: 64, increase for GPU)
-- --data-file: Path to German training text (default: training_data_german.txt)
+- `--epochs`: Training iterations (default: 10)
+- `--seq-length`: Input sequence length (default: 50, higher = longer context memory)
+- `--batch-size`: Parallel sequences per batch (default: 64, increase for GPU)
+- `--data-file`: Path to German training text (default: training_data_german.txt)
 
 
 
